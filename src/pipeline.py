@@ -1,22 +1,26 @@
-"""CLI entrypoint for the end-to-end macro recession ETL & modeling pipeline."""
+"""CLI entrypoint for the Phase 2 global multi-region ETL & modeling pipeline."""
 
 from __future__ import annotations
 
 import logging
 import sys
+import time
+from typing import Iterable
 
 from dotenv import load_dotenv
 
 from src.config import (
+    ALL_REGIONS,
     BQ_DATASET,
     BQ_LOCATION,
-    DEFAULT_REGION,
     GCP_PROJECT_ID,
+    HORIZONS,
     MODEL_LOGISTIC,
+    MODEL_REGIONS,
 )
-from src.features import build_monthly_features
-from src.ingest import fetch_all_fred_series
-from src.modeling import run_walk_forward_models
+from src.features import build_all_regions_features
+from src.ingest import fetch_all_regions_raw
+from src.modeling import run_all_regions_modeling
 from src.warehouse import BigQueryWarehouse
 
 logging.basicConfig(
@@ -27,34 +31,41 @@ logger = logging.getLogger(__name__)
 
 
 def run_pipeline(
-    region: str = DEFAULT_REGION,
+    regions: Iterable[str] = MODEL_REGIONS,
     project_id: str = GCP_PROJECT_ID,
     dataset_id: str = BQ_DATASET,
     location: str = BQ_LOCATION,
 ) -> dict[str, object]:
-    """Execute ingest -> features -> walk-forward modeling -> BigQuery batch load."""
+    """Execute multi-region ingest -> features -> walk-forward ML + GLOBAL -> BigQuery."""
+    t0 = time.perf_counter()
     load_dotenv()
+    region_list = tuple(regions)
 
-    logger.info("Step 1/4: Ingesting FRED macro series for region=%s...", region)
-    raw_df = fetch_all_fred_series(region=region)
+    logger.info("Step 1/4: Ingesting FRED, BIS SDMX, and OECD SDMX series for %s...", region_list)
+    raw_df = fetch_all_regions_raw(regions=region_list)
     logger.info(
-        "Fetched %d raw observations across %d series.",
+        "Fetched %d raw observations across %d regions and %d distinct series.",
         len(raw_df),
-        raw_df["series_id"].nunique(),
+        raw_df["region"].nunique(),
+        raw_df[["region", "series_id"]].drop_duplicates().shape[0],
     )
 
-    logger.info("Step 2/4: Engineering point-in-time monthly features...")
-    features_df = build_monthly_features(raw_df, region=region)
-    logger.info(
-        "Built %d monthly feature rows (%s to %s).",
-        len(features_df),
-        features_df["as_of_date"].min().strftime("%Y-%m-%d"),
-        features_df["as_of_date"].max().strftime("%Y-%m-%d"),
-    )
+    logger.info("Step 2/4: Engineering point-in-time monthly features & Option A targets...")
+    features_df = build_all_regions_features(raw_df, regions=region_list)
+    for reg in region_list:
+        sub = features_df[features_df["region"] == reg]
+        logger.info(
+            "  [%s] %d monthly rows (%s to %s; labeled=%d)",
+            reg,
+            len(sub),
+            sub["as_of_date"].min().strftime("%Y-%m-%d"),
+            sub["as_of_date"].max().strftime("%Y-%m-%d"),
+            int(sub["target_recession"].notna().sum()),
+        )
 
-    logger.info("Step 3/4: Running expanding-window walk-forward ML models...")
-    predictions_df, metrics_df, contributions_df = run_walk_forward_models(
-        features_df, region=region
+    logger.info("Step 3/4: Running multi-region walk-forward ML & GLOBAL GDP-weighted aggregate...")
+    predictions_df, metrics_df, contributions_df = run_all_regions_modeling(
+        features_df, regions=region_list
     )
     logger.info(
         "Generated %d prediction rows, %d metric rows, %d contribution rows.",
@@ -82,22 +93,34 @@ def run_pipeline(
         contributions_df=contributions_df,
     )
 
-    latest_date = predictions_df["as_of_date"].max()
-    latest_curve = predictions_df[
-        (predictions_df["as_of_date"] == latest_date)
-        & (predictions_df["model_name"] == MODEL_LOGISTIC)
-    ].sort_values("horizon_months")
+    elapsed = time.perf_counter() - t0
 
+    print(f"\n=== Pipeline Runtime: {elapsed:.1f}s ===")
     print("\n=== BigQuery Table Row Counts ===")
     for table_name, count in row_counts.items():
         print(f"  {project_id}.{dataset_id}.{table_name}: {count:,} rows")
 
-    print(f"\n=== Latest Risk Curve ({MODEL_LOGISTIC}, as_of_date={latest_date.strftime('%Y-%m-%d')}) ===")
-    for _, row in latest_curve.iterrows():
-        print(f"  {int(row['horizon_months']):>2d}M: {row['recession_prob'] * 100:5.1f}%")
+    print(f"\n=== Latest Risk Curves ({MODEL_LOGISTIC}) Across All 6 Regions ===")
+    header = f"{'Region':<8} {'Latest Date':<12} " + " ".join(f"{h:>5d}M" for h in HORIZONS)
+    print(header)
+    print("-" * len(header))
+    for reg in ALL_REGIONS:
+        sub = predictions_df[
+            (predictions_df["region"] == reg) & (predictions_df["model_name"] == MODEL_LOGISTIC)
+        ]
+        if sub.empty:
+            continue
+        latest_dt = sub["as_of_date"].max()
+        latest_row = sub[sub["as_of_date"] == latest_dt].set_index("horizon_months")["recession_prob"]
+        vals = " ".join(
+            f"{latest_row[h] * 100:5.1f}%" if h in latest_row.index else "    - "
+            for h in HORIZONS
+        )
+        print(f"{reg:<8} {latest_dt.strftime('%Y-%m-%d'):<12} {vals}")
 
-    print("\n=== Out-of-Sample Model Metrics ===")
+    print("\n=== Cross-Region Out-of-Sample Metrics (ROC-AUC / PR-AUC / Brier Score) ===")
     display_cols = [
+        "region",
         "horizon_months",
         "model_name",
         "n_obs",
@@ -107,12 +130,20 @@ def run_pipeline(
         "brier_score",
         "base_rate",
     ]
-    print(metrics_df[display_cols].to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    ordered_metrics = metrics_df.copy()
+    ordered_metrics["_reg_order"] = ordered_metrics["region"].map(
+        {r: i for i, r in enumerate(MODEL_REGIONS)}
+    )
+    ordered_metrics = ordered_metrics.sort_values(
+        ["_reg_order", "horizon_months", "model_name"]
+    ).drop(columns=["_reg_order"])
+    print(ordered_metrics[display_cols].to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
     return {
+        "elapsed_seconds": elapsed,
         "row_counts": row_counts,
-        "latest_as_of_date": latest_date,
         "metrics_df": metrics_df,
+        "predictions_df": predictions_df,
     }
 
 

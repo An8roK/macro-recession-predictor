@@ -1,4 +1,4 @@
-"""BigQuery warehouse management: free batch loads (WRITE_TRUNCATE) and read queries."""
+"""BigQuery warehouse management: free batch loads (WRITE_TRUNCATE) and multi-region queries."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ import pandas as pd
 from google.cloud import bigquery
 
 from src.config import (
+    ALL_FEATURE_COLUMNS,
+    ALL_REGIONS,
     ALL_TABLES,
     BQ_DATASET,
     BQ_LOCATION,
     DEFAULT_REGION,
-    FEATURE_COLUMNS,
     GCP_PROJECT_ID,
     TABLE_CONTRIBUTIONS,
     TABLE_METRICS,
@@ -24,7 +25,8 @@ from src.config import (
 
 logger = logging.getLogger(__name__)
 
-# Explicit BigQuery schemas matching docs/ARCHITECTURE.md Section 5
+# Explicit BigQuery schemas matching docs/ARCHITECTURE.md Section 6.
+# All 21 feature columns in monthly_features are NULLABLE so US and international rows coexist cleanly.
 TABLE_SCHEMAS: dict[str, list[bigquery.SchemaField]] = {
     TABLE_RAW_SERIES: [
         bigquery.SchemaField("region", "STRING", mode="REQUIRED"),
@@ -37,7 +39,7 @@ TABLE_SCHEMAS: dict[str, list[bigquery.SchemaField]] = {
         bigquery.SchemaField("region", "STRING", mode="REQUIRED"),
         bigquery.SchemaField("as_of_date", "DATE", mode="REQUIRED"),
         bigquery.SchemaField("target_recession", "INT64", mode="NULLABLE"),
-        *[bigquery.SchemaField(col, "FLOAT64", mode="REQUIRED") for col in FEATURE_COLUMNS],
+        *[bigquery.SchemaField(col, "FLOAT64", mode="NULLABLE") for col in ALL_FEATURE_COLUMNS],
         bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
     ],
     TABLE_PREDICTIONS: [
@@ -87,7 +89,6 @@ def _prepare_dataframe_for_bq(
     for field in schema:
         col = field.name
         if field.field_type == "DATE":
-            # Convert to Python datetime.date objects so pyarrow maps cleanly to BigQuery DATE.
             out[col] = pd.to_datetime(out[col]).dt.date
         elif field.field_type == "TIMESTAMP":
             out[col] = pd.to_datetime(out[col], utc=True)
@@ -188,17 +189,21 @@ class BigQueryWarehouse:
         return self.client.query(sql, job_config=job_config, location=self.location).to_dataframe()
 
     def read_available_regions(self) -> list[str]:
-        """Return distinct regions currently populated in recession_predictions."""
+        """Return distinct regions populated in recession_predictions in canonical UI order."""
         sql = f"""
             SELECT DISTINCT region
             FROM `{self.table_ref(TABLE_PREDICTIONS)}`
-            ORDER BY region
         """
         df = self.client.query(sql, location=self.location).to_dataframe()
-        return df["region"].tolist() if not df.empty else [DEFAULT_REGION]
+        if df.empty:
+            return [DEFAULT_REGION]
+        found = set(df["region"].tolist())
+        ordered = [r for r in ALL_REGIONS if r in found]
+        extras = sorted(found - set(ALL_REGIONS))
+        return ordered + extras
 
     def read_predictions(self, region: str = DEFAULT_REGION) -> pd.DataFrame:
-        """Read precomputed recession predictions for a region."""
+        """Read precomputed recession predictions for a single region."""
         sql = f"""
             SELECT region, as_of_date, horizon_months, model_name,
                    recession_prob, is_oos, actual_recession, updated_at
@@ -211,8 +216,21 @@ class BigQueryWarehouse:
             df["as_of_date"] = pd.to_datetime(df["as_of_date"])
         return df
 
+    def read_all_predictions(self) -> pd.DataFrame:
+        """Read precomputed recession predictions across all regions (for GLOBAL views)."""
+        sql = f"""
+            SELECT region, as_of_date, horizon_months, model_name,
+                   recession_prob, is_oos, actual_recession, updated_at
+            FROM `{self.table_ref(TABLE_PREDICTIONS)}`
+            ORDER BY region, as_of_date, horizon_months, model_name
+        """
+        df = self.client.query(sql, location=self.location).to_dataframe()
+        if not df.empty:
+            df["as_of_date"] = pd.to_datetime(df["as_of_date"])
+        return df
+
     def read_metrics(self, region: str = DEFAULT_REGION) -> pd.DataFrame:
-        """Read OOS validation metrics for a region."""
+        """Read OOS validation metrics for a single region."""
         sql = f"""
             SELECT region, horizon_months, model_name, eval_start_date, eval_end_date,
                    n_obs, n_recessions, roc_auc, pr_auc, brier_score, base_rate, updated_at
@@ -226,8 +244,22 @@ class BigQueryWarehouse:
             df["eval_end_date"] = pd.to_datetime(df["eval_end_date"])
         return df
 
+    def read_all_metrics(self) -> pd.DataFrame:
+        """Read OOS validation metrics across all modeled economies."""
+        sql = f"""
+            SELECT region, horizon_months, model_name, eval_start_date, eval_end_date,
+                   n_obs, n_recessions, roc_auc, pr_auc, brier_score, base_rate, updated_at
+            FROM `{self.table_ref(TABLE_METRICS)}`
+            ORDER BY region, horizon_months, model_name
+        """
+        df = self.client.query(sql, location=self.location).to_dataframe()
+        if not df.empty:
+            df["eval_start_date"] = pd.to_datetime(df["eval_start_date"])
+            df["eval_end_date"] = pd.to_datetime(df["eval_end_date"])
+        return df
+
     def read_contributions(self, region: str = DEFAULT_REGION) -> pd.DataFrame:
-        """Read latest log-odds driver attributions for a region."""
+        """Read latest driver attributions (or GLOBAL regional breakdown) for a region."""
         sql = f"""
             SELECT region, as_of_date, horizon_months, feature_name,
                    raw_value, standardized_value, coef, log_odds_contrib, updated_at
@@ -241,8 +273,8 @@ class BigQueryWarehouse:
         return df
 
     def read_monthly_features(self, region: str = DEFAULT_REGION) -> pd.DataFrame:
-        """Read monthly point-in-time features and NBER recession indicator for a region."""
-        feature_cols_sql = ", ".join(FEATURE_COLUMNS)
+        """Read monthly point-in-time features and target indicator for a region."""
+        feature_cols_sql = ", ".join(ALL_FEATURE_COLUMNS)
         sql = f"""
             SELECT region, as_of_date, target_recession, {feature_cols_sql}, updated_at
             FROM `{self.table_ref(TABLE_MONTHLY_FEATURES)}`

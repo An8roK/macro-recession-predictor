@@ -1,4 +1,4 @@
-"""Expanding-window walk-forward multi-horizon modeling with strict embargo."""
+"""Multi-region expanding-window walk-forward modeling, embargo, and GLOBAL composite."""
 
 from __future__ import annotations
 
@@ -15,11 +15,13 @@ from sklearn.preprocessing import StandardScaler
 
 from src.config import (
     DEFAULT_REGION,
-    FEATURE_COLUMNS,
+    GLOBAL_REGION,
+    GLOBAL_WEIGHTS,
     HORIZONS,
     MODEL_LOGISTIC,
+    MODEL_REGIONS,
     MODEL_RF,
-    OOS_START_DATE,
+    REGION_SPECS,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,7 +38,7 @@ def build_horizon_target(
     target_recession: pd.Series,
     horizon_months: int,
 ) -> pd.Series:
-    """Construct y(t, h) = USREC(t + h) using exact calendar-month lookup."""
+    """Construct y(t, h) = target_recession(t + h) using exact calendar-month lookup."""
     months = _month_index(dates)
     lookup: dict[int, int] = {}
     for m, val in zip(months, target_recession):
@@ -53,16 +55,19 @@ def get_embargoed_train_mask(
     eval_date: pd.Timestamp,
     horizon_months: int,
     latest_labeled_date: pd.Timestamp | None = None,
+    settlement_lag_months: int = 0,
 ) -> np.ndarray:
     """Return boolean mask of training rows strictly satisfying the walk-forward embargo.
 
     Rules:
     - Training row must have a known label (`y_horizon` not NA).
-    - Strict leakage embargo: `t_train + h <= cutoff`, where `cutoff` is `eval_date`
-      for historical OOS evaluation, or `min(eval_date, latest_labeled_date)` for live
-      rows where `t_eval + h` lies in the future.
-    - Never include `t_eval` itself in its own training set (`t_train < eval_date`),
-      which matters specifically when `h == 0`.
+    - Strict leakage embargo:
+        * US, CN, IN (`settlement_lag_months = 0`): `t_train + h <= cutoff`
+        * EU, JP (`settlement_lag_months = 3`): `t_train + h + 3 <= cutoff`
+          (quarterly GDP settlement & 2Q contraction confirmation buffer).
+      where `cutoff` is `eval_date` for historical OOS rows, or
+      `min(eval_date, latest_labeled_date)` for live forecast rows.
+    - Never include `t_eval` itself in its own training set (`t_train < eval_date`).
     """
     train_months = _month_index(dates)
     eval_ts = pd.Timestamp(eval_date)
@@ -75,17 +80,17 @@ def get_embargoed_train_mask(
         cutoff_month = min(cutoff_month, latest_month)
 
     has_label = y_horizon.notna().to_numpy(dtype=bool)
-    embargo_ok = (train_months + horizon_months) <= cutoff_month
+    embargo_ok = (train_months + horizon_months + settlement_lag_months) <= cutoff_month
     strictly_prior = train_months < eval_month
     return has_label & embargo_ok & strictly_prior
 
 
-def _make_logistic_pipeline() -> Pipeline:
+def _make_logistic_pipeline(c_reg: float = 0.5) -> Pipeline:
     """Primary calibrated linear model: StandardScaler + L2 Logistic Regression."""
     return Pipeline(
         [
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(C=0.5, max_iter=1000)),
+            ("clf", LogisticRegression(C=c_reg, max_iter=1000)),
         ]
     )
 
@@ -109,7 +114,6 @@ def _fit_and_predict_prob(
     """Fit estimator on training window and return (fitted_model, P(y=1))."""
     unique_classes = np.unique(y_train)
     if len(unique_classes) < 2:
-        # Degenerate single-class window fallback (should not occur in full US history)
         return None, float(unique_classes[0])
 
     estimator.fit(X_train, y_train)
@@ -120,6 +124,7 @@ def _fit_and_predict_prob(
 def _compute_logistic_contributions(
     fitted_pipeline: Pipeline,
     x_row: np.ndarray,
+    feature_columns: tuple[str, ...],
     as_of_date: pd.Timestamp,
     horizon_months: int,
     region: str,
@@ -135,7 +140,7 @@ def _compute_logistic_contributions(
 
     rows: list[dict] = []
     for feat_name, raw_v, z_v, c_v, contrib_v in zip(
-        FEATURE_COLUMNS, x_row, z_vals, coefs, contribs
+        feature_columns, x_row, z_vals, coefs, contribs
     ):
         rows.append(
             {
@@ -156,62 +161,88 @@ def _compute_logistic_contributions(
 def run_walk_forward_models(
     features_df: pd.DataFrame,
     horizons: Iterable[int] = HORIZONS,
-    oos_start_date: str = OOS_START_DATE,
+    oos_start_date: str | None = None,
     region: str = DEFAULT_REGION,
+    feature_columns: tuple[str, ...] | None = None,
+    settlement_lag_months: int | None = None,
+    logistic_refit_interval: int = 3,
     rf_refit_interval: int = 12,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Execute expanding-window walk-forward training, live scoring, attribution, and OOS metrics.
 
-    Returns:
-        (predictions_df, metrics_df, contributions_df) matching BigQuery table schemas.
+    Speed & causality guarantees:
+    - Dynamically selects each region's active feature columns and settlement embargo from config.
+    - Refits `logistic_l2` every 3 months (quarterly) and `random_forest` every 12 months on the
+      expanding embargoed window; live rows and the latest as_of_date always use the freshest
+      embargoed fit.
+    - Skips early OOS rows if the embargoed training window does not yet contain both classes.
     """
-    df = features_df.sort_values("as_of_date").reset_index(drop=True).copy()
+    spec = REGION_SPECS[region]
+    active_features = tuple(feature_columns) if feature_columns is not None else spec.feature_columns
+    oos_start = oos_start_date or spec.oos_start_date
+    settlement_lag = (
+        settlement_lag_months if settlement_lag_months is not None else spec.settlement_lag_months
+    )
+    logistic_c = spec.logistic_c
+
+    df = features_df.copy()
+    if "region" in df.columns:
+        df = df[df["region"] == region].copy()
+    df = df.sort_values("as_of_date").reset_index(drop=True)
     df["as_of_date"] = pd.to_datetime(df["as_of_date"])
 
     labeled_dates = df.loc[df["target_recession"].notna(), "as_of_date"]
     if labeled_dates.empty:
-        raise ValueError("No labeled target_recession observations found in features_df.")
+        raise ValueError(f"No labeled target_recession observations found for region={region}.")
     latest_labeled_date = pd.Timestamp(labeled_dates.max())
     latest_as_of_date = pd.Timestamp(df["as_of_date"].max())
-    oos_start_ts = pd.Timestamp(oos_start_date)
+    oos_start_ts = pd.Timestamp(oos_start)
 
-    X_all = df[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float64)
+    X_all = df[list(active_features)].to_numpy(dtype=np.float64)
     dates_series = df["as_of_date"]
     updated_at = pd.Timestamp.now(tz="UTC")
 
     oos_indices = df.index[df["as_of_date"] >= oos_start_ts].to_list()
     if not oos_indices:
-        raise ValueError(f"No rows found on or after OOS start date {oos_start_date}.")
+        raise ValueError(f"No rows found on or after OOS start date {oos_start} for region={region}.")
 
     prediction_records: list[dict] = []
     contribution_records: list[dict] = []
 
     for h in horizons:
-        logger.info("Running walk-forward models for horizon h=%dM...", h)
+        logger.info(
+            "Running walk-forward models [%s] h=%dM (features=%d, C=%.2f, embargo=+%dM, oos>=%s)...",
+            region,
+            h,
+            len(active_features),
+            logistic_c,
+            settlement_lag,
+            oos_start,
+        )
         y_h = build_horizon_target(dates_series, df["target_recession"], h)
 
-        # Fit live models once on all labeled rows satisfying t_train + h <= latest_labeled_date
+        # Fit live models once on all labeled rows satisfying t_train + h + settlement <= latest_labeled
         live_mask = get_embargoed_train_mask(
             dates=dates_series,
             y_horizon=y_h,
             eval_date=latest_as_of_date + pd.offsets.MonthEnd(1),
             horizon_months=h,
             latest_labeled_date=latest_labeled_date,
+            settlement_lag_months=settlement_lag,
         )
         X_live_train = X_all[live_mask]
         y_live_train = y_h.to_numpy()[live_mask].astype(np.int64)
 
-        live_logistic = _make_logistic_pipeline()
         live_logistic, _ = _fit_and_predict_prob(
-            live_logistic, X_live_train, y_live_train, X_all[-1:].copy()
+            _make_logistic_pipeline(c_reg=logistic_c), X_live_train, y_live_train, X_all[-1:].copy()
         )
-        live_rf = _make_random_forest()
         live_rf, _ = _fit_and_predict_prob(
-            live_rf, X_live_train, y_live_train, X_all[-1:].copy()
+            _make_random_forest(), X_live_train, y_live_train, X_all[-1:].copy()
         )
 
-        # Track the exact logistic pipeline that scores latest_as_of_date for exact attribution
         latest_logistic_model: Pipeline | None = None
+        log_model_cache: Pipeline | None = None
+        log_steps_since_fit = logistic_refit_interval
         rf_model_cache = None
         rf_steps_since_fit = rf_refit_interval
 
@@ -222,17 +253,10 @@ def run_walk_forward_models(
             x_eval = X_all[idx : idx + 1]
 
             if is_live_row:
-                # Live forecast row: actual_recession is NULL, use full embargoed live model
-                prob_log = (
-                    float(live_logistic.predict_proba(x_eval)[0, 1])
-                    if live_logistic is not None
-                    else float(np.mean(y_live_train))
-                )
-                prob_rf = (
-                    float(live_rf.predict_proba(x_eval)[0, 1])
-                    if live_rf is not None
-                    else float(np.mean(y_live_train))
-                )
+                if len(np.unique(y_live_train)) < 2:
+                    continue
+                prob_log = float(live_logistic.predict_proba(x_eval)[0, 1])
+                prob_rf = float(live_rf.predict_proba(x_eval)[0, 1])
                 if eval_date == latest_as_of_date:
                     latest_logistic_model = live_logistic
             else:
@@ -242,31 +266,36 @@ def run_walk_forward_models(
                     eval_date=eval_date,
                     horizon_months=h,
                     latest_labeled_date=latest_labeled_date,
+                    settlement_lag_months=settlement_lag,
                 )
                 X_train = X_all[train_mask]
                 y_train = y_h.to_numpy()[train_mask].astype(np.int64)
-                if len(y_train) == 0:
+                # Guarantee both classes exist in the expanding window before emitting OOS scores
+                if len(np.unique(y_train)) < 2:
                     continue
 
-                # 1. logistic_l2: refit every month on expanding window
-                log_model, prob_log = _fit_and_predict_prob(
-                    _make_logistic_pipeline(), X_train, y_train, x_eval
-                )
-                if eval_date == latest_as_of_date:
-                    latest_logistic_model = log_model
+                # 1. logistic_l2: quarterly refit (plus fresh fit on latest_as_of_date)
+                force_latest_fit = eval_date == latest_as_of_date
+                if log_model_cache is None or log_steps_since_fit >= logistic_refit_interval or force_latest_fit:
+                    log_model_cache, prob_log = _fit_and_predict_prob(
+                        _make_logistic_pipeline(c_reg=logistic_c), X_train, y_train, x_eval
+                    )
+                    log_steps_since_fit = 1
+                else:
+                    prob_log = float(log_model_cache.predict_proba(x_eval)[0, 1])
+                    log_steps_since_fit += 1
 
-                # 2. random_forest: refit every 12 months on expanding window
+                if force_latest_fit:
+                    latest_logistic_model = log_model_cache
+
+                # 2. random_forest: annual refit
                 if rf_model_cache is None or rf_steps_since_fit >= rf_refit_interval:
                     rf_model_cache, prob_rf = _fit_and_predict_prob(
                         _make_random_forest(), X_train, y_train, x_eval
                     )
                     rf_steps_since_fit = 1
                 else:
-                    prob_rf = (
-                        float(rf_model_cache.predict_proba(x_eval)[0, 1])
-                        if rf_model_cache is not None
-                        else float(np.mean(y_train))
-                    )
+                    prob_rf = float(rf_model_cache.predict_proba(x_eval)[0, 1])
                     rf_steps_since_fit += 1
 
             actual_int = pd.NA if is_live_row else int(actual_val)
@@ -295,13 +324,13 @@ def run_walk_forward_models(
                 }
             )
 
-        # Compute exact driver attributions for the latest as_of_date from logistic_l2
         attribution_model = latest_logistic_model or live_logistic
         if attribution_model is not None:
             contribution_records.extend(
                 _compute_logistic_contributions(
                     fitted_pipeline=attribution_model,
                     x_row=X_all[-1],
+                    feature_columns=active_features,
                     as_of_date=latest_as_of_date,
                     horizon_months=h,
                     region=region,
@@ -321,6 +350,82 @@ def run_walk_forward_models(
 
     metrics_df = compute_oos_metrics(predictions_df, updated_at=updated_at)
     return predictions_df, metrics_df, contributions_df
+
+
+def build_global_aggregate(
+    predictions_df: pd.DataFrame,
+    weights: dict[str, float] = GLOBAL_WEIGHTS,
+    updated_at: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute GDP-weighted GLOBAL recession predictions and latest regional contributions.
+
+    Weights are dynamically re-normalized whenever fewer than 5 economies have OOS
+    predictions on a given date (e.g., pre-2010 dates before EU OOS begins).
+    """
+    ts = updated_at or pd.Timestamp.now(tz="UTC")
+    reg_preds = predictions_df[predictions_df["region"].isin(weights.keys())].copy()
+    if reg_preds.empty:
+        raise ValueError("Cannot compute GLOBAL aggregate without constituent region predictions.")
+
+    reg_preds["as_of_date"] = pd.to_datetime(reg_preds["as_of_date"])
+    reg_preds["raw_weight"] = reg_preds["region"].map(weights).astype(float)
+
+    # Dynamic weight re-normalization per (as_of_date, horizon_months, model_name)
+    group_cols = ["as_of_date", "horizon_months", "model_name"]
+    weight_sums = reg_preds.groupby(group_cols)["raw_weight"].transform("sum")
+    reg_preds["norm_weight"] = reg_preds["raw_weight"] / weight_sums
+    reg_preds["weighted_prob"] = reg_preds["norm_weight"] * reg_preds["recession_prob"]
+
+    global_preds = (
+        reg_preds.groupby(group_cols, as_index=False)["weighted_prob"]
+        .sum()
+        .rename(columns={"weighted_prob": "recession_prob"})
+    )
+    global_preds["region"] = GLOBAL_REGION
+    global_preds["is_oos"] = True
+    global_preds["actual_recession"] = pd.Series([pd.NA] * len(global_preds), dtype="Int64")
+    global_preds["updated_at"] = ts
+    global_preds = global_preds[
+        [
+            "region",
+            "as_of_date",
+            "horizon_months",
+            "model_name",
+            "recession_prob",
+            "is_oos",
+            "actual_recession",
+            "updated_at",
+        ]
+    ]
+    global_preds["horizon_months"] = global_preds["horizon_months"].astype("int64")
+    global_preds["recession_prob"] = global_preds["recession_prob"].astype("float64")
+    global_preds["is_oos"] = global_preds["is_oos"].astype("bool")
+
+    # Latest regional contribution breakdown (weight * regional_prob) for Tab 3 under GLOBAL
+    latest_date = pd.Timestamp(global_preds["as_of_date"].max())
+    latest_rows = reg_preds[
+        (reg_preds["as_of_date"] == latest_date) & (reg_preds["model_name"] == MODEL_LOGISTIC)
+    ].copy()
+
+    contrib_records: list[dict] = []
+    for _, row in latest_rows.iterrows():
+        contrib_records.append(
+            {
+                "region": GLOBAL_REGION,
+                "as_of_date": latest_date,
+                "horizon_months": int(row["horizon_months"]),
+                "feature_name": str(row["region"]),
+                "raw_value": float(row["recession_prob"]),
+                "standardized_value": float(row["norm_weight"]),
+                "coef": float(row["norm_weight"]),
+                "log_odds_contrib": float(row["weighted_prob"]),
+                "updated_at": ts,
+            }
+        )
+    global_contribs = pd.DataFrame(contrib_records)
+    if not global_contribs.empty:
+        global_contribs["horizon_months"] = global_contribs["horizon_months"].astype("int64")
+    return global_preds, global_contribs
 
 
 def compute_oos_metrics(
@@ -370,3 +475,35 @@ def compute_oos_metrics(
             ["region", "horizon_months", "model_name"]
         ).reset_index(drop=True)
     return metrics_df
+
+
+def run_all_regions_modeling(
+    features_df: pd.DataFrame,
+    regions: Iterable[str] = MODEL_REGIONS,
+    horizons: Iterable[int] = HORIZONS,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run walk-forward modeling for every modeled economy and append the GLOBAL composite."""
+    pred_frames: list[pd.DataFrame] = []
+    metric_frames: list[pd.DataFrame] = []
+    contrib_frames: list[pd.DataFrame] = []
+
+    for reg in regions:
+        p_df, m_df, c_df = run_walk_forward_models(
+            features_df=features_df,
+            horizons=horizons,
+            region=reg,
+        )
+        pred_frames.append(p_df)
+        metric_frames.append(m_df)
+        contrib_frames.append(c_df)
+
+    all_preds = pd.concat(pred_frames, ignore_index=True)
+    all_metrics = pd.concat(metric_frames, ignore_index=True)
+    all_contribs = pd.concat(contrib_frames, ignore_index=True)
+
+    global_preds, global_contribs = build_global_aggregate(all_preds)
+    all_preds = pd.concat([all_preds, global_preds], ignore_index=True)
+    all_contribs = pd.concat([all_contribs, global_contribs], ignore_index=True)
+
+    all_preds["actual_recession"] = all_preds["actual_recession"].astype("Int64")
+    return all_preds, all_metrics, all_contribs

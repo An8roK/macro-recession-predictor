@@ -4,6 +4,7 @@ pandas
 numpy
 scikit-learn
 google-cloud-bigquery
+pandas-gbq
 pyarrow
 db-dtypes
 streamlit
