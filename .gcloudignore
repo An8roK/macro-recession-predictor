@@ -1,0 +1,25 @@
+# Local environments & secrets
+.venv/
+venv/
+.env
+.env.*
+
+# Version control & IDE/agent metadata
+.git/
+.gitignore
+.agent/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.log
+
+# Non-runtime project directories
+tests/
+docs/
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
